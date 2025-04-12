@@ -1,0 +1,197 @@
+---
+title: "limma analysis for bottom-up proteomics data"
+author: "Alison FA Chaves"
+execute:
+  echo: false
+  warning: false
+  message: false
+format: html
+code-fold: true
+editor_options: 
+  chunk_output_type: console
+---
+
+## Required packages for data analysis
+
+```{r}
+library(diann) # to extract the MaxLFQ matrix from DIANN report
+library(arrow) # to read the report.parquet file
+library(here) # to avoid the need for use the path while loading the data
+library(tidyverse) # to do the data wrangling, plots, etc...
+library(janitor) # to clean the column names (variables with bad names)
+library(limma) # to do the linear model analysis
+library(ggtext) # to provide Markdown and HTML formatting in ggplot2
+library(ggrepel) # to avoid the overlapping of the labels in the plots
+
+theme_set(theme_classic()) # to set a common theme for the plots
+```
+
+# Import and filter the report.parquet file from DIA-NN search
+We filter the data using Lib.PG.Q.Value ≤ 0.01, Lib.Q.Value ≤ 0.01, and PG.Q.Value ≤ 0.01 and remove the contaminants (cRAP) from the analysis. Then, we extract the matrix of protein abundance from the report.parquet file. The report.parquet file contains the results of the DIA-NN search, including the protein groups, their q-values, and the MaxLFQ values for each sample. The MaxLFQ values are the normalized abundance values for each protein in each sample. Our matrix will be filtered to include only the unique peptides (proteotypic) and the protein group q-value ≤ 0.01. This is the protein abundance matrix that will be used for the limma analysis.
+
+```{r}
+# loading the report.parquet file from DIA-NN search.
+diann_report <- arrow::read_parquet("report.parquet") %>%
+    dplyr::filter(Lib.PG.Q.Value <= 0.01 & Lib.Q.Value <= 0.01 & PG.Q.Value <= 0.01) %>%
+    dplyr::mutate(File.Name = Run) %>% 
+  dplyr::filter(str_detect(Protein.Ids, "cRAP", negate = TRUE))
+
+# Checking the number of samples in the report.parquet file and the names.
+count(diann_report, Run) %>% 
+  print(n = Inf)
+
+# Extracting the matrix of abundance from DIA-NN report.parquet file.
+prot_mtx <- diann::diann_matrix(diann_report,
+    id.header = "Protein.Ids",
+    quantity.header = "Genes.MaxLFQ.Unique",
+    proteotypic.only = T,
+    pg.q = .01)
+```
+
+# Compute the statistics using `limma model`
+First of all, we will construct a design matrix. The design matrix is a matrix of 0s and 1s that indicates which samples belong to which groups. We will use the column names of the protein abundance matrix to create the design matrix, but you can find a different solution that works for you. The model may include the intercept (the mean protein abundance of the groups) and the groups of interest, as for example, mixA and mixB. This is usefull when we want to compare the means of the groups and we have more than two groups. For instance, *model.matrix(~ 0 + Control + Treatment1 + Treatment2)* will include the intercept and the groups of interest. If we have only two groups, we can remove the intercept and use only the group of interest. for instance, *model.matrix(~ Treatment)* will include only the Treatment.
+
+*Reference:* Ritchie ME, Phipson B, Wu D, Hu Y, Law CW, Shi W, Smyth GK. limma powers differential expression analyses for RNA-sequencing and microarray studies. Nucleic Acids Res. 2015 Apr 20;43(7):e47. doi: 10.1093/nar/gkv007. Epub 2015 Jan 20. PMID: 25605792; PMCID: PMC4402510.
+
+```{r}
+# Construct a design matrix. This matrix will be used to fit the linear model identifying the differences between the groups.
+groups_for_design <- str_extract(colnames(prot_mtx), "mixA|mixB")
+design_matrix <- model.matrix(~ 0 + groups_for_design)
+colnames(design_matrix) <- str_remove(colnames(design_matrix), "groups_for_design")
+
+# Fit linear model for each gene given a series of arrays
+# The method "ls" means least squares (allows missing values). you can choose "robust" (does not allow missing values) for account for outliers
+limma_model <- lmFit(log2(prot_mtx),
+    design = design_matrix,
+    method = "ls")
+
+# Construct the contrast matrix corresponding to specified contrasts of a set of parameters.
+contrast_matrix <- makeContrasts(
+    mixB_vs_mixA = mixB - mixA,
+    levels = c("mixA", "mixB")
+)
+
+# Given a linear model fit to microarray data, compute estimated coefficients and standard errors for a given set of contrasts.
+estimated_coef <- contrasts.fit(limma_model,
+                                contrast_matrix)
+
+# Given a linear model fit from lmFit, compute moderated t-statistics, moderated F-statistic, and log-odds of differential expression by empirical Bayes moderation of the standard errors towards a global value.
+empirical_Bayes_fit <- eBayes(estimated_coef)
+
+# Check the coefficient names of the empirical Bayes fit.
+coef(empirical_Bayes_fit) %>% 
+  head()
+
+# Extract the results from limma analysis with Benjamini-Hochberg correction for multiple testing.
+# Observe that the cutoff for significance is set to 0.05 and the logFC is set to 0.58 (1.5 fold change).
+# You may want to change these values according to your experiment assumptions.
+results_limma <- topTable(empirical_Bayes_fit,
+                          coef = "mixB_vs_mixA",
+                          number = Inf,
+                          sort.by = "none",
+                          adjust.method = "BH") %>%
+  rownames_to_column("proteins") %>% 
+  dplyr::mutate(status = case_when(
+            logFC > 0.58 & adj.P.Val <= 0.05 ~ "Increased",
+            logFC < -0.58 & adj.P.Val <= 0.05 ~ "Decreased",
+            TRUE ~ "Not significant"),
+            status = factor(status, levels = c("Decreased", "Not significant", "Increased"))
+  )
+
+# write a tsv file containing the table with the results of limma analysis
+write_tsv(results_limma,
+          file = "results_limma.tsv")
+```
+
+# Volcano plot
+The volcano plot will show the log2 fold change (x-axis) and the -log10 p-value (y-axis). To avoid the compression of the points in the plot, we will use an inverse logarithmic scale for the y-axis. Remember that the lower the p-value, the more significant the result. The log2 fold change is a measure of the magnitude of the change in protein abundance between the two groups. A positive log2 fold change indicates an increase in protein abundance in mixB compared to mixA, while a negative log2 fold change indicates a decrease in protein abundance in mixB compared to mixA. The points will be colored according to the status of the proteins (Increased, Decreased, Not significant). The proteins with a log2 fold change > 0.58 and a p-value < 0.05 will be annotated in the bottom plot. We want to avoid the compression of the point in the upper limits of the y-axis. Hence, we will use the p-value instead of the adjusted p-value. This way we can see the proteins that are significant in the upper limits of the y-axis and distinguish the ones which are significant but did not pass the cutoff for the adjusted p-value.
+
+```{r}
+# We can use the number of proteins differentially abundant as a label in the plot.
+# To do this, we wil create a dataframe with the number of proteins differentially abundant.
+signif_proteins <- results_limma %>%
+  dplyr::filter(status != "Not significant") %>%
+  group_by(status) %>%
+  dplyr::summarise(proteins = n())
+
+# Create a volcano plot with the results of limma analysis.
+volcano_plot <- ggplot(results_limma, aes(x = logFC,
+                          y = -log10(P.Value), 
+                          color = status)) +
+  geom_point(alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(size = 5, alpha = 1))) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-0.58, 0.58), linetype = "dashed", color = "black") +
+  geom_text(data = signif_proteins %>% 
+              dplyr::filter(status == "Decreased"),
+    aes(x = -1, y = 0.3, label = paste0(status, ": ", proteins)),
+    size = 4, fontface = "bold") +
+  geom_text(data = signif_proteins %>% 
+              dplyr::filter(status == "Increased"),
+    aes(x = 1, y = 0.3, label = paste0(status, ": ", proteins)),
+    size = 4, fontface = "bold") +
+  scale_color_manual(values = c("Decreased" = "steelblue",
+                                "Not significant" = "grey",
+                                "Increased" = "firebrick")) +
+  labs(title = "Volcano plot of limma analysis",
+       x = "log2(Fold Change)",
+       y = "-log10(p-value)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(face = "bold")
+        )
+
+# Save the volcano plot as a png figure with 300 dpi in the plots folder.
+ggsave("volcano_plot.png",
+       plot = volcano_plot,
+       path = "plots",
+       units = "in",
+       width = 8,
+       height = 6,
+       dpi = 300)
+```
+
+# Bland-Altman / Tukey Mean-Difference plot (MD plot)
+We can extract more visual information from the data using a Bland-Altman plot. The Bland-Altman plot is a scatter plot of the difference between two measurements against the average of the two measurements. Volcano plots can be misleading if one start to extract importance of the protein from the y-axis. That a reminder that p-values are measures of statistical significance, not biological significance (which maybe can be extracted from magnitude of the differences). The Bland-Altman plot is a good way to visualize the agreement between two measurements. In this case, we will use the log2 fold change as the difference between the two measurements and the average of the two measurements as the x-axis. The mean and standard deviation of the differences will be used to create the limits of agreement. The limits of agreement are the mean difference ± 1.96 times the standard deviation of the differences. The points will be colored according to the status of the proteins (Increased, Decreased, Not significant). The proteins with a log2 fold change > 0.58 and a p-value < 0.05 will be annotated in the bottom plot.
+
+*Reference:* Bland JM, Altman DG. Statistical methods for assessing agreement between two methods of clinical measurement. Lancet. 1986 Feb 8;1(8476):307-10. PMID: 2868172.
+
+```{r}
+MD_plot <- ggplot(results_limma, aes(x = AveExpr,
+                          y = logFC,
+                          color = status)) +
+  geom_point(alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(size = 5, alpha = 1))) +
+  geom_hline(yintercept = c(-0.58, 0.58), linetype = "dashed", color = "black") +
+  geom_text(data = signif_proteins %>% 
+              dplyr::filter(status == "Decreased"),
+    aes(x = 30, y = -1, label = paste0(status, ": ", proteins)),
+    size = 4, fontface = "bold") +
+  geom_text(data = signif_proteins %>% 
+              dplyr::filter(status == "Increased"),
+    aes(x = 30, y = 1, label = paste0(status, ": ", proteins)),
+    size = 4, fontface = "bold") +
+  scale_color_manual(values = c("Decreased" = "steelblue",
+                                "Not significant" = "grey",
+                                "Increased" = "firebrick")) +
+  labs(title = "Bland-Altman plot of limma analysis",
+       x = "Average protein abundance (log2)",
+       y = "log2(Fold Change)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(face = "bold")
+        )
+
+# Save the Meam Difference plot as a png figure with 300 dpi in the plots folder.
+ggsave("MD_plot.png",
+       plot = MD_plot,
+       path = "plots",
+       units = "in",
+       width = 8,
+       height = 6,
+       dpi = 300)
+```
